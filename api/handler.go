@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"strconv"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -30,30 +31,30 @@ type Response struct {
 
 // CreateJobRequest 创建任务请求
 type CreateJobRequest struct {
-	Namespace    string              `json:"namespace" binding:"required"`
-	JobKey       string              `json:"job_key" binding:"required"`
-	Desc         string              `json:"desc"`
-	ScheduleType entity.ScheduleType `json:"schedule_type" binding:"required"`
-	ScheduleExpr string              `json:"schedule_expr"`
-	ExecuteType  entity.ExecuteType  `json:"execute_type" binding:"required"`
-	Payload      *entity.JobPayload  `json:"payload" binding:"required"`
-	Extra        *entity.JobExtraInfo `json:"extra"`
-	CreatedBy    string              `json:"created_by"`
-	NextTriggerTime int64            `json:"next_trigger_time,omitempty"` // 用于延迟任务
+	Namespace       string               `json:"namespace" binding:"required"`
+	JobKey          string               `json:"job_key" binding:"required"`
+	Desc            string               `json:"desc"`
+	ScheduleType    entity.ScheduleType  `json:"schedule_type" binding:"required"`
+	ScheduleExpr    string               `json:"schedule_expr"`
+	ExecuteType     entity.ExecuteType   `json:"execute_type" binding:"required"`
+	Payload         *entity.JobPayload   `json:"payload" binding:"required"`
+	Extra           *entity.JobExtraInfo `json:"extra"`
+	CreatedBy       string               `json:"created_by"`
+	NextTriggerTime int64                `json:"next_trigger_time,omitempty"` // 用于延迟任务
 }
 
 // UpdateJobRequest 更新任务请求
 type UpdateJobRequest struct {
-	Id           uint64              `json:"id" binding:"required"`
-	Namespace    string              `json:"namespace" binding:"required"`
-	JobKey       string              `json:"job_key" binding:"required"`
-	Desc         string              `json:"desc"`
-	ScheduleType entity.ScheduleType `json:"schedule_type" binding:"required"`
-	ScheduleExpr string              `json:"schedule_expr"`
-	ExecuteType  entity.ExecuteType  `json:"execute_type" binding:"required"`
-	Payload      *entity.JobPayload  `json:"payload" binding:"required"`
-	Extra        *entity.JobExtraInfo `json:"extra"`
-	NextTriggerTime int64            `json:"next_trigger_time,omitempty"`
+	Id              uint64               `json:"id" binding:"required"`
+	Namespace       string               `json:"namespace" binding:"required"`
+	JobKey          string               `json:"job_key" binding:"required"`
+	Desc            string               `json:"desc"`
+	ScheduleType    entity.ScheduleType  `json:"schedule_type" binding:"required"`
+	ScheduleExpr    string               `json:"schedule_expr"`
+	ExecuteType     entity.ExecuteType   `json:"execute_type" binding:"required"`
+	Payload         *entity.JobPayload   `json:"payload" binding:"required"`
+	Extra           *entity.JobExtraInfo `json:"extra"`
+	NextTriggerTime int64                `json:"next_trigger_time,omitempty"`
 }
 
 // CreateJob 创建任务
@@ -148,7 +149,7 @@ func (h *JobHandler) GetJob(ctx context.Context, c *app.RequestContext) {
 
 	job, err := h.jobService.GetJob(ctx, id)
 	if err != nil {
-		if err == service.ErrJobNotFound {
+		if errors.Is(err, service.ErrJobNotFound) {
 			c.JSON(consts.StatusNotFound, Response{
 				Code:    consts.StatusNotFound,
 				Message: "job not found",
@@ -181,8 +182,8 @@ func (h *JobHandler) DeleteJob(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
-	if err := h.jobService.DeleteJob(ctx, id); err != nil {
-		if err == service.ErrJobNotFound {
+	if err = h.jobService.DeleteJob(ctx, id); err != nil {
+		if errors.Is(err, service.ErrJobNotFound) {
 			c.JSON(consts.StatusNotFound, Response{
 				Code:    consts.StatusNotFound,
 				Message: "job not found",
@@ -214,8 +215,8 @@ func (h *JobHandler) PauseJob(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
-	if err := h.jobService.PauseJob(ctx, id); err != nil {
-		if err == service.ErrJobNotFound {
+	if err = h.jobService.PauseJob(ctx, id); err != nil {
+		if errors.Is(err, service.ErrJobNotFound) {
 			c.JSON(consts.StatusNotFound, Response{
 				Code:    consts.StatusNotFound,
 				Message: "job not found",
@@ -247,8 +248,8 @@ func (h *JobHandler) ResumeJob(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
-	if err := h.jobService.ResumeJob(ctx, id); err != nil {
-		if err == service.ErrJobNotFound {
+	if err = h.jobService.ResumeJob(ctx, id); err != nil {
+		if errors.Is(err, service.ErrJobNotFound) {
 			c.JSON(consts.StatusNotFound, Response{
 				Code:    consts.StatusNotFound,
 				Message: "job not found",

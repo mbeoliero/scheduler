@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -33,7 +34,10 @@ func NewTaskQueue(rdb redis.UniversalClient, keyPrefix string) *TaskQueue {
 // PushTask 推送任务到队列
 func (r *TaskQueue) PushTask(ctx context.Context, msg *TaskMessage) error {
 	key := r.keyPrefix + ":task_queue_worker"
-	data, _ := sonic.Marshal(msg)
+	data, err := sonic.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal task message: %w", err)
+	}
 	return r.rdb.LPush(ctx, key, data).Err()
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	redislock "github.com/go-co-op/gocron-redis-lock/v2"
@@ -27,7 +28,9 @@ type Scheduler struct {
 	queue             *TaskQueue
 	mu                sync.RWMutex
 	loadedJobs        map[string]gocron.Job // jobKey -> gocron Job
+	jobVersions       map[string]int64      // jobKey -> job.UpdatedAt，用于检查任务是否变更
 	stopWorker        chan struct{}
+	started           atomic.Bool
 	workerPool        chan struct{} // 协程池信号量，限制并发数
 }
 
@@ -63,6 +66,7 @@ func NewScheduler(cfg config.SchedulerConfig) (*Scheduler, error) {
 		queue:             queue,
 		mu:                sync.RWMutex{},
 		loadedJobs:        make(map[string]gocron.Job),
+		jobVersions:       make(map[string]int64),
 		stopWorker:        make(chan struct{}),
 		workerPool:        make(chan struct{}, cfg.MaxWorkers), // 初始化协程池
 	}, nil
@@ -85,6 +89,8 @@ func (s *Scheduler) Start(ctx context.Context) {
 		panic(err)
 	}
 	log.CtxInfo(ctx, "start scheduler job success, job name: %s", job.Name())
+
+	s.started.Store(true)
 	go s.startWorker(ctx)
 }
 
@@ -122,9 +128,19 @@ func (s *Scheduler) scheduleJob(ctx context.Context, job *entity.Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if loadedJob, exists := s.loadedJobs[job.UniqueKey()]; exists {
-		_ = s.executorCron.RemoveJob(loadedJob.ID())
-		delete(s.loadedJobs, job.UniqueKey())
+	jobKey := job.UniqueKey()
+	// 检查任务是否已加载且未变更，避免重复加载
+	if loadedJob, exists := s.loadedJobs[jobKey]; exists {
+		if oldVersion, ok := s.jobVersions[jobKey]; ok && oldVersion == job.UpdatedAt {
+			return nil
+		}
+
+		// 任务已变更，移除旧任务
+		if err := s.executorCron.RemoveJob(loadedJob.ID()); err != nil {
+			log.CtxWarn(ctx, "failed to remove old job, jobKey: %s, err: %v", jobKey, err)
+		}
+		delete(s.loadedJobs, jobKey)
+		delete(s.jobVersions, jobKey)
 	}
 
 	var jobDef gocron.JobDefinition
@@ -142,9 +158,10 @@ func (s *Scheduler) scheduleJob(ctx context.Context, job *entity.Job) error {
 	case entity.ScheduleTypeImmediate, entity.ScheduleTypeDelayed:
 		delay := time.Until(time.UnixMilli(job.NextTriggerTime))
 		if delay < 0 {
-			delay = 0
+			jobDef = gocron.OneTimeJob(gocron.OneTimeJobStartImmediately())
+		} else {
+			jobDef = gocron.OneTimeJob(gocron.OneTimeJobStartDateTime(time.Now().Add(delay)))
 		}
-		jobDef = gocron.OneTimeJob(gocron.OneTimeJobStartDateTime(time.Now().Add(delay)))
 	default:
 		return nil
 	}
@@ -158,8 +175,10 @@ func (s *Scheduler) scheduleJob(ctx context.Context, job *entity.Job) error {
 					log.CtxError(context.Background(), "job execution panic, jobKey: %s, err: %v", jobCopy.JobKey, r)
 				}
 			}()
-			taskCtx, cancel := context.WithTimeout(ctx, s.cfg.DefaultTimeout)
+
+			taskCtx, cancel := context.WithTimeout(context.TODO(), s.cfg.DefaultTimeout)
 			defer cancel()
+			
 			s.triggerJob(taskCtx, &jobCopy)
 		}),
 		gocron.WithName(job.UniqueKey()),
@@ -169,8 +188,9 @@ func (s *Scheduler) scheduleJob(ctx context.Context, job *entity.Job) error {
 		return err
 	}
 
-	s.loadedJobs[job.UniqueKey()] = gcJob
-	log.CtxDebug(ctx, "scheduled job successfully, jobKey: %s", job.JobKey)
+	s.loadedJobs[jobKey] = gcJob
+	s.jobVersions[jobKey] = job.UpdatedAt
+	log.CtxInfo(ctx, "scheduled job successfully, jobKey: %s", job.JobKey)
 	return nil
 }
 
@@ -214,6 +234,8 @@ func (s *Scheduler) triggerJob(ctx context.Context, job *entity.Job) {
 		}
 		if err = s.queue.PushTask(ctx, msg); err != nil {
 			log.CtxError(ctx, "push task failed, recordId: %d, jobId: %d, err: %v", record.Id, job.Id, err)
+			// 补偿机制：推送失败时将记录状态更新为失败，避免任务丢失
+			_ = repo.GetJobRecordRepo().UpdateStatus(ctx, record.Id, entity.JobRecordStatusFailed, fmt.Sprintf("push to queue failed: %v", err))
 			return
 		}
 	} else {
@@ -333,6 +355,9 @@ func (s *Scheduler) processTask(ctx context.Context, jobId, recordId int64) (err
 	var result = &executor.Result{}
 	defer func() {
 		if err != nil {
+			if result == nil {
+				result = &executor.Result{}
+			}
 			result.Error = err.Error()
 			uErr := repo.GetJobRecordRepo().UpdateStatus(ctx, uint64(recordId), entity.JobRecordStatusFailed, result.Error)
 			if uErr != nil {
@@ -360,9 +385,13 @@ func (s *Scheduler) processTask(ctx context.Context, jobId, recordId int64) (err
 	log.CtxInfo(ctx, "execute job, recordId: %d, jobId: %d, jobKey: %s, cost time: %v", recordId, jobId, job.JobKey, time.Since(start))
 
 	result, err = exec.Execute(execCtx, job.Payload)
-	if err != nil || result == nil {
+	if err != nil {
 		log.CtxError(ctx, "execute job failed, jobId: %d, err: %v", jobId, err)
 		return fmt.Errorf("execute job failed, jobId: %d, err: %w", jobId, err)
+	}
+	if result == nil {
+		log.CtxError(ctx, "execute job returned nil result, jobId: %d", jobId)
+		return fmt.Errorf("execute job returned nil result, jobId: %d", jobId)
 	}
 
 	if result.Success {
@@ -387,8 +416,12 @@ func (s *Scheduler) processTask(ctx context.Context, jobId, recordId int64) (err
 }
 
 func (s *Scheduler) Stop(ctx context.Context) {
-	close(s.stopWorker)
+	if !s.started.Load() {
+		return
+	}
+
 	_ = s.listPendingCron.Shutdown()
 	s.listLeaderElector.Stop()
 	_ = s.executorCron.Shutdown()
+	s.started.Store(false)
 }

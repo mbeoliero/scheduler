@@ -10,7 +10,7 @@ import (
 
 type Config struct {
 	Server    ServerConfig    `mapstructure:"server"`
-	MySQL     MySqlConfig     `mapstructure:"mysql"`
+	MySql     MySqlConfig     `mapstructure:"mysql"`
 	Redis     RedisConfig     `mapstructure:"redis"`
 	Scheduler SchedulerConfig `mapstructure:"scheduler"`
 }
@@ -45,8 +45,8 @@ type SchedulerConfig struct {
 	LeaderRenew        time.Duration `mapstructure:"leader_renew"`
 	LockerExpiry       time.Duration `mapstructure:"locker_expiry"`
 	DefaultTimeout     time.Duration `mapstructure:"default_timeout"`
-	BatchSize          int           `mapstructure:"batch_size"`   // 批量查询任务数量限制
-	MaxWorkers         int           `mapstructure:"max_workers"`  // 最大并发工作协程数
+	BatchSize          int           `mapstructure:"batch_size"`  // 批量查询任务数量限制
+	MaxWorkers         int           `mapstructure:"max_workers"` // 最大并发工作协程数
 }
 
 var globalConfig *Config
@@ -90,4 +90,9 @@ func Load(configPath string) (*Config, error) {
 
 func Get() *Config {
 	return globalConfig
+}
+
+// SetConfig sets the global config (used for testing)
+func SetConfig(cfg *Config) {
+	globalConfig = cfg
 }
