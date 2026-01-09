@@ -18,13 +18,14 @@ redis:
 
 scheduler:
   scheduler_key_prefix: "scheduler"
+  scheduler_loop_interval: 5 # 调度循环间隔(秒)
   leader_key: "leader"
   pre_read_seconds: 60       # 预读任务时间窗口(秒)
   enable_task_queue: false   # 是否启用任务队列
-  leader_ttl: 15             # Leader锁超时时间(秒)
-  leader_renew: 5            # Leader续约间隔(秒)
-  locker_expiry: 30          # 分布式锁过期时间(秒)
-  default_timeout: 60        # 默认任务超时(秒)
+  leader_ttl: 5             # Leader锁超时时间(秒)
+  leader_renew: 2            # Leader续约间隔(秒)
+  locker_expiry: 10          # 分布式锁过期时间(秒)
+  default_timeout: 30        # 默认任务超时(秒)
   batch_size: 100            # 批量查询任务数量限制
   max_workers: 50            # 最大并发工作协程数
 

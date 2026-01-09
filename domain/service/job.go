@@ -196,7 +196,7 @@ func (s *JobService) validateJob(job *entity.Job) error {
 		}
 		dur, err := time.ParseDuration(job.ScheduleExpr)
 		if err != nil {
-			return fmt.Errorf("%w: invalid delay duration: %v", ErrInvalidSchedule, err)
+			return fmt.Errorf("%w: invalid delay duration: %w", ErrInvalidSchedule, err)
 		}
 		if dur <= 0 {
 			return fmt.Errorf("%w: delay duration must be positive", ErrInvalidSchedule)
@@ -209,7 +209,7 @@ func (s *JobService) validateJob(job *entity.Job) error {
 		// 使用 cron 库校验表达式
 		_, err := cronParser.Parse(job.ScheduleExpr)
 		if err != nil {
-			return fmt.Errorf("%w: invalid cron expression: %v", ErrInvalidSchedule, err)
+			return fmt.Errorf("%w: invalid cron expression: %w", ErrInvalidSchedule, err)
 		}
 	case entity.ScheduleTypePeriodicRate:
 		// 固定频率，需要验证表达式（如 "1m", "5s"）
@@ -218,7 +218,7 @@ func (s *JobService) validateJob(job *entity.Job) error {
 		}
 		dur, err := time.ParseDuration(job.ScheduleExpr)
 		if err != nil {
-			return fmt.Errorf("%w: invalid duration: %v", ErrInvalidSchedule, err)
+			return fmt.Errorf("%w: invalid duration: %w", ErrInvalidSchedule, err)
 		}
 		// 频率不能小于 1 秒
 		if dur < time.Second {
@@ -234,32 +234,13 @@ func (s *JobService) validateJob(job *entity.Job) error {
 // calculateNextTriggerTime 计算下次触发时间
 func (s *JobService) calculateNextTriggerTime(job *entity.Job) error {
 	now := time.Now()
+	job.Status = entity.JobStatusActive
 
-	switch job.ScheduleType {
-	case entity.ScheduleTypeImmediate:
-		// 立即执行
-		job.NextTriggerTime = now.UnixMilli()
-		job.Status = entity.JobStatusActive
-	case entity.ScheduleTypeDelayed:
-		// 延迟执行，使用指定的时间
-		if job.NextTriggerTime <= 0 {
-			return ErrInvalidSchedule
-		}
-		job.Status = entity.JobStatusActive
-	case entity.ScheduleTypePeriodicCron:
-		// 根据 cron 表达式计算下一次触发时间
-		schedule, err := cronParser.Parse(job.ScheduleExpr)
-		if err != nil {
-			return fmt.Errorf("%w: failed to parse cron expression: %v", ErrInvalidSchedule, err)
-		}
-		nextTime := schedule.Next(now)
-		job.NextTriggerTime = nextTime.UnixMilli()
-		job.Status = entity.JobStatusActive
-	case entity.ScheduleTypePeriodicRate:
-		// 固定频率任务，首次立即执行
-		job.NextTriggerTime = now.UnixMilli()
-		job.Status = entity.JobStatusActive
+	nt, err := CalcNextRunTime(job.ScheduleType, job.ScheduleExpr, now)
+	if err != nil {
+		return err
 	}
 
+	job.NextTriggerTime = nt.UnixMilli()
 	return nil
 }

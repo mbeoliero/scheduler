@@ -38,7 +38,7 @@ func (j *jobRepo) FindById(ctx context.Context, id uint64) (*entity.Job, error) 
 
 func (j *jobRepo) ListPendingJobs(ctx context.Context, latestTriggerTime int64, limit int64) ([]*entity.Job, error) {
 	return gorm.G[*entity.Job](j.db).
-		Where("next_trigger_time <= ? AND job_status = ?", latestTriggerTime, entity.JobStatusActive).
+		Where("next_trigger_time <= ? AND status = ?", latestTriggerTime, entity.JobStatusActive).
 		Order("next_trigger_time").
 		Limit(int(limit)).
 		Find(ctx)

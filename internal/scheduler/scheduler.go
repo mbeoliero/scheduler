@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/mbeoliero/scheduler/domain/entity"
 	"github.com/mbeoliero/scheduler/domain/repo"
+	"github.com/mbeoliero/scheduler/domain/service"
 	"github.com/mbeoliero/scheduler/infra/config"
 	"github.com/mbeoliero/scheduler/infra/redis"
 	"github.com/mbeoliero/scheduler/internal/executor"
@@ -30,12 +32,18 @@ type Scheduler struct {
 	loadedJobs        map[string]gocron.Job // jobKey -> gocron Job
 	jobVersions       map[string]int64      // jobKey -> job.UpdatedAt，用于检查任务是否变更
 	stopWorker        chan struct{}
+	stopOnce          sync.Once
 	started           atomic.Bool
 	workerPool        chan struct{} // 协程池信号量，限制并发数
+	wg                sync.WaitGroup
 }
 
 func NewScheduler(cfg config.SchedulerConfig) (*Scheduler, error) {
-	listLeaderElector, err := NewElector(redis.GetClient(), GetNodeId(), cfg.LeaderKey, WithLockPrefix(cfg.SchedulerKeyPrefix), WithExpiry(cfg.LeaderTtl), WithAutoExtendDuration(cfg.LeaderRenew))
+	nodeId := cfg.NodeId
+	if nodeId == "" {
+		nodeId = GetNodeId()
+	}
+	listLeaderElector, err := NewElector(redis.GetClient(), nodeId, cfg.LeaderKey, WithLockPrefix(cfg.SchedulerKeyPrefix), WithExpiry(cfg.LeaderTtl), WithAutoExtendDuration(cfg.LeaderRenew))
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +87,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 
 	// 每五秒执行一次
 	job, err := s.listPendingCron.NewJob(
-		gocron.DurationJob(5*time.Second),
+		gocron.DurationJob(s.cfg.SchedulerLoopInterval),
 		gocron.NewTask(func() {
 			s.loadPendingJobs(ctx)
 		}),
@@ -126,7 +134,6 @@ func (s *Scheduler) loadPendingJobs(ctx context.Context) {
 
 func (s *Scheduler) scheduleJob(ctx context.Context, job *entity.Job) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	jobKey := job.UniqueKey()
 	// 检查任务是否已加载且未变更，避免重复加载
@@ -142,6 +149,7 @@ func (s *Scheduler) scheduleJob(ctx context.Context, job *entity.Job) error {
 		delete(s.loadedJobs, jobKey)
 		delete(s.jobVersions, jobKey)
 	}
+	s.mu.Unlock()
 
 	var jobDef gocron.JobDefinition
 	switch job.ScheduleType {
@@ -178,7 +186,7 @@ func (s *Scheduler) scheduleJob(ctx context.Context, job *entity.Job) error {
 
 			taskCtx, cancel := context.WithTimeout(context.TODO(), s.cfg.DefaultTimeout)
 			defer cancel()
-			
+
 			s.triggerJob(taskCtx, &jobCopy)
 		}),
 		gocron.WithName(job.UniqueKey()),
@@ -188,6 +196,8 @@ func (s *Scheduler) scheduleJob(ctx context.Context, job *entity.Job) error {
 		return err
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.loadedJobs[jobKey] = gcJob
 	s.jobVersions[jobKey] = job.UpdatedAt
 	log.CtxInfo(ctx, "scheduled job successfully, jobKey: %s", job.JobKey)
@@ -248,12 +258,13 @@ func (s *Scheduler) triggerJob(ctx context.Context, job *entity.Job) {
 		// 使用 workerPool 控制并发，改为异步执行
 		select {
 		case s.workerPool <- struct{}{}:
+			s.wg.Add(1)
 			go func() {
+				defer s.wg.Done()
 				defer func() { <-s.workerPool }()
 				defer func() {
 					if r := recover(); r != nil {
 						log.CtxError(ctx, "async process task panic, recordId: %d, err: %v", record.Id, r)
-						// 尝试更新状态为失败
 						_ = repo.GetJobRecordRepo().UpdateStatus(ctx, record.Id, entity.JobRecordStatusFailed, fmt.Sprintf("panic: %v", r))
 					}
 				}()
@@ -274,8 +285,11 @@ func (s *Scheduler) triggerJob(ctx context.Context, job *entity.Job) {
 }
 
 func (s *Scheduler) updateNextTriggerTime(ctx context.Context, job *entity.Job) {
-	var nextTime int64
+	if !s.started.Load() {
+		return
+	}
 
+	var nextTime int64
 	if job.ScheduleType == entity.ScheduleTypePeriodicCron || job.ScheduleType == entity.ScheduleTypePeriodicRate {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -287,8 +301,17 @@ func (s *Scheduler) updateNextTriggerTime(ctx context.Context, job *entity.Job) 
 		}
 		nt, err := eJob.NextRun()
 		if err != nil {
-			log.CtxError(ctx, "get next run time failed, jobKey: %s, err: %v", job.JobKey, err)
-			return
+			if errors.Is(err, gocron.ErrJobNotFound) { // 这个时候可能刚好 scheduler退出了
+				log.CtxWarn(ctx, "job not found, jobKey: %s", job.JobKey)
+				nt, err = service.CalcNextRunTime(job.ScheduleType, job.ScheduleExpr, time.Now())
+				if err != nil {
+					log.CtxError(ctx, "calc next run time failed, jobKey: %s, err: %v", job.JobKey, err)
+					return
+				}
+			} else {
+				log.CtxError(ctx, "get next run time failed, jobKey: %s, err: %v", job.JobKey, err)
+				return
+			}
 		}
 
 		nextTime = nt.UnixMilli()
@@ -326,7 +349,9 @@ func (s *Scheduler) runTaskWorker(ctx context.Context) {
 	// 使用协程池限制并发数
 	select {
 	case s.workerPool <- struct{}{}: // 获取协程池槽位
+		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
 			defer func() { <-s.workerPool }() // 释放槽位
 			defer func() {
 				if r := recover(); r != nil {
@@ -348,6 +373,7 @@ func (s *Scheduler) processTaskFromQueue(ctx context.Context, msg *TaskMessage) 
 		return
 	}
 
+	log.CtxInfo(ctx, "process task from queue, recordId: %d, jobId: %d, jobKey: %s", msg.RecordId, msg.JobId, msg.JobKey)
 	_ = s.processTask(ctx, msg.JobId, msg.RecordId)
 }
 
@@ -382,9 +408,9 @@ func (s *Scheduler) processTask(ctx context.Context, jobId, recordId int64) (err
 		log.CtxError(ctx, "get executor failed, jobId: %d, err: %v", jobId, err)
 		return fmt.Errorf("get executor failed, jobId: %d, err: %w", jobId, err)
 	}
-	log.CtxInfo(ctx, "execute job, recordId: %d, jobId: %d, jobKey: %s, cost time: %v", recordId, jobId, job.JobKey, time.Since(start))
 
 	result, err = exec.Execute(execCtx, job.Payload)
+	log.CtxInfo(ctx, "execute job, recordId: %d, jobId: %d, jobKey: %s, result[%s], err: %v, cost time: %v", recordId, jobId, job.JobKey, result.Log(), err, time.Since(start))
 	if err != nil {
 		log.CtxError(ctx, "execute job failed, jobId: %d, err: %v", jobId, err)
 		return fmt.Errorf("execute job failed, jobId: %d, err: %w", jobId, err)
@@ -420,8 +446,27 @@ func (s *Scheduler) Stop(ctx context.Context) {
 		return
 	}
 
+	s.started.Store(false)
+	s.stopOnce.Do(func() {
+		close(s.stopWorker)
+	})
+
 	_ = s.listPendingCron.Shutdown()
 	s.listLeaderElector.Stop()
 	_ = s.executorCron.Shutdown()
-	s.started.Store(false)
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	if _, ok := ctx.Deadline(); ok {
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+		return
+	}
+	<-done
 }
