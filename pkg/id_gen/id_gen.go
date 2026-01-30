@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/sony/sonyflake/v2"
+
+	"github.com/mbeoliero/scheduler/pkg/testx"
 )
 
 var DefaultStartTime = time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
@@ -28,9 +30,20 @@ func (f *FlakeIdGenerator) NextId(ctx context.Context) (int64, error) {
 }
 
 func init() {
-	sf, err := sonyflake.New(sonyflake.Settings{
-		StartTime: DefaultStartTime,
-	})
+	var sf *sonyflake.Sonyflake
+	var err error
+	if testx.RunningUnderTest() {
+		sf, err = sonyflake.New(sonyflake.Settings{
+			StartTime: DefaultStartTime,
+			MachineID: func() (int, error) {
+				return 1, nil
+			},
+		})
+	} else {
+		sf, err = sonyflake.New(sonyflake.Settings{
+			StartTime: DefaultStartTime,
+		})
+	}
 	if err != nil {
 		panic(err)
 	}

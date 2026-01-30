@@ -16,6 +16,19 @@ type Result struct {
 	Error   string `json:"error,omitempty"`
 }
 
+func (r *Result) Log() string {
+	if r == nil {
+		return "result is null"
+	}
+	if r.Success {
+		if len(r.Output) < 20 {
+			return fmt.Sprintf("success: %s", r.Output)
+		}
+		return fmt.Sprintf("success: %s", r.Output[:20])
+	}
+	return fmt.Sprintf("error: %s", r.Error)
+}
+
 type Executor interface {
 	Execute(ctx context.Context, config *entity.JobPayload) (*Result, error)
 }

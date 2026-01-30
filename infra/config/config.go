@@ -37,16 +37,18 @@ type RedisConfig struct {
 }
 
 type SchedulerConfig struct {
-	SchedulerKeyPrefix string        `mapstructure:"scheduler_key_prefix"`
-	LeaderKey          string        `mapstructure:"leader_key"`
-	PreReadSeconds     int           `mapstructure:"pre_read_seconds"`
-	EnableTaskQueue    bool          `mapstructure:"enable_task_queue"`
-	LeaderTtl          time.Duration `mapstructure:"leader_ttl"`
-	LeaderRenew        time.Duration `mapstructure:"leader_renew"`
-	LockerExpiry       time.Duration `mapstructure:"locker_expiry"`
-	DefaultTimeout     time.Duration `mapstructure:"default_timeout"`
-	BatchSize          int           `mapstructure:"batch_size"`  // 批量查询任务数量限制
-	MaxWorkers         int           `mapstructure:"max_workers"` // 最大并发工作协程数
+	SchedulerKeyPrefix    string        `mapstructure:"scheduler_key_prefix"`
+	SchedulerLoopInterval time.Duration `mapstructure:"scheduler_loop_interval"`
+	LeaderKey             string        `mapstructure:"leader_key"`
+	PreReadSeconds        int           `mapstructure:"pre_read_seconds"`
+	EnableTaskQueue       bool          `mapstructure:"enable_task_queue"`
+	LeaderTtl             time.Duration `mapstructure:"leader_ttl"`
+	LeaderRenew           time.Duration `mapstructure:"leader_renew"`
+	LockerExpiry          time.Duration `mapstructure:"locker_expiry"`
+	DefaultTimeout        time.Duration `mapstructure:"default_timeout"`
+	BatchSize             int           `mapstructure:"batch_size"`  // 批量查询任务数量限制
+	MaxWorkers            int           `mapstructure:"max_workers"` // 最大并发工作协程数
+	NodeId                string        `mapstructure:"-"`           // 节点ID，仅用于测试手动指定，配置文件中无需配置
 }
 
 var globalConfig *Config
@@ -65,6 +67,7 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	// 转换时间单位
+	cfg.Scheduler.SchedulerLoopInterval *= time.Second
 	cfg.Scheduler.LeaderTtl *= time.Second
 	cfg.Scheduler.LeaderRenew *= time.Second
 	cfg.Scheduler.LockerExpiry *= time.Second

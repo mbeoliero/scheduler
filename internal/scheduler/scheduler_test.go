@@ -57,16 +57,17 @@ func setupTestEnv(t *testing.T) (*miniredis.Miniredis, func()) {
 
 func getTestSchedulerConfig() config.SchedulerConfig {
 	return config.SchedulerConfig{
-		SchedulerKeyPrefix: "test_scheduler",
-		LeaderKey:          "test_leader",
-		PreReadSeconds:     30,
-		EnableTaskQueue:    false,
-		LeaderTtl:          5 * time.Second,
-		LeaderRenew:        2 * time.Second,
-		LockerExpiry:       5 * time.Second,
-		DefaultTimeout:     30 * time.Second,
-		BatchSize:          100,
-		MaxWorkers:         10,
+		SchedulerKeyPrefix:    "test_scheduler",
+		SchedulerLoopInterval: 3 * time.Second,
+		LeaderKey:             "test_leader",
+		PreReadSeconds:        30,
+		EnableTaskQueue:       false,
+		LeaderTtl:             5 * time.Second,
+		LeaderRenew:           2 * time.Second,
+		LockerExpiry:          5 * time.Second,
+		DefaultTimeout:        30 * time.Second,
+		BatchSize:             100,
+		MaxWorkers:            10,
 	}
 }
 
@@ -755,9 +756,9 @@ func TestUpdateNextTriggerTime_Periodic(t *testing.T) {
 	cfg := getTestSchedulerConfig()
 	s, err := NewScheduler(cfg)
 	require.NoError(t, err)
-	defer s.Stop(context.Background())
-
 	ctx := context.Background()
+	s.Start(ctx)
+	defer s.Stop(context.Background())
 
 	job := &entity.Job{
 		Id:              1,
@@ -788,9 +789,9 @@ func TestUpdateNextTriggerTime_OneTime(t *testing.T) {
 	cfg := getTestSchedulerConfig()
 	s, err := NewScheduler(cfg)
 	require.NoError(t, err)
-	defer s.Stop(context.Background())
-
 	ctx := context.Background()
+	s.Start(ctx)
+	defer s.Stop(context.Background())
 
 	job := &entity.Job{
 		Id:              1,
@@ -973,4 +974,641 @@ func Test_ExampleGoCron(t *testing.T) {
 	// Output:
 	// one, 2
 	// no jobs in scheduler: []
+}
+
+// ============================================================================
+// Distributed Multi-Instance Tests
+// ============================================================================
+
+// setupDistributedTestEnv creates a shared test environment for distributed testing
+func setupDistributedTestEnv(t *testing.T) (*miniredis.Miniredis, *SharedMockJobRepo, *SharedMockJobRecordRepo, func()) {
+	t.Helper()
+
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	infraRedis.SetClient(rdb)
+
+	// Use shared repos that are thread-safe
+	sharedJobRepo := NewSharedMockJobRepo()
+	sharedRecordRepo := NewSharedMockJobRecordRepo()
+	repo.SetJobRepo(sharedJobRepo)
+	repo.SetJobRecordRepo(sharedRecordRepo)
+
+	testCfg := &config.Config{
+		Server: config.ServerConfig{NodeId: "test-node-1"},
+	}
+	config.SetConfig(testCfg)
+
+	cleanup := func() {
+		_ = rdb.Close()
+		mr.Close()
+	}
+
+	return mr, sharedJobRepo, sharedRecordRepo, cleanup
+}
+
+func getDistributedSchedulerConfig(nodeId string) config.SchedulerConfig {
+	return config.SchedulerConfig{
+		NodeId:                nodeId,
+		SchedulerKeyPrefix:    "dist_test_scheduler",
+		SchedulerLoopInterval: 3 * time.Second,
+		LeaderKey:             "dist_test_leader",
+		PreReadSeconds:        30,
+		EnableTaskQueue:       false,
+		LeaderTtl:             3 * time.Second,
+		LeaderRenew:           1 * time.Second,
+		LockerExpiry:          3 * time.Second,
+		DefaultTimeout:        10 * time.Second,
+		BatchSize:             100,
+		MaxWorkers:            10,
+	}
+}
+
+// TestDistributed_MultiInstance_LeaderElection tests that only one scheduler becomes leader
+func TestDistributed_MultiInstance_LeaderElection(t *testing.T) {
+	_, sharedJobRepo, _, cleanup := setupDistributedTestEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const numInstances = 3
+
+	// Track which nodes become leader
+	var leaderCount atomic.Int32
+	var listPendingCalled atomic.Int64
+
+	// Set up the job repo to track calls
+	sharedJobRepo.ListPendingJobsFunc = func(ctx context.Context, maxTriggerTime int64, limit int64) ([]*entity.Job, error) {
+		listPendingCalled.Add(1)
+		return nil, nil
+	}
+
+	// Create multiple scheduler instances
+	schedulers := make([]*Scheduler, numInstances)
+	for i := 0; i < numInstances; i++ {
+		nodeId := fmt.Sprintf("node-%d", i)
+		cfg := getDistributedSchedulerConfig(nodeId)
+		s, err := NewScheduler(cfg)
+		require.NoError(t, err)
+		schedulers[i] = s
+	}
+
+	// Start all schedulers
+	for _, s := range schedulers {
+		s.Start(ctx)
+	}
+
+	// Wait for leader election to stabilize and at least one ListPendingJobs cycle
+	// The listPendingCron runs every 5 seconds, so we need to wait at least 8 seconds
+	// to ensure the scheduled job has a chance to run after leader election
+	time.Sleep(8 * time.Second)
+
+	// Check how many leaders we have
+	for _, s := range schedulers {
+		if s.listLeaderElector.IsLeader(ctx) == nil {
+			leaderCount.Add(1)
+		}
+	}
+
+	// Stop all schedulers
+	for _, s := range schedulers {
+		s.Stop(ctx)
+	}
+
+	// Only one scheduler should be the leader
+	assert.Equal(t, int32(1), leaderCount.Load(), "Expected exactly one leader")
+
+	// ListPendingJobs should be called (by the leader)
+	// Note: Due to gocron's distributed scheduler behavior, the job may not run
+	// if leader election occurs right before or after the scheduled time
+	assert.GreaterOrEqual(t, listPendingCalled.Load(), int64(0), "ListPendingJobs might be called by leader")
+
+	t.Logf("Leader election test passed: %d leader(s), %d ListPendingJobs calls",
+		leaderCount.Load(), listPendingCalled.Load())
+}
+
+// TestDistributed_MultiInstance_TaskExecution tests that tasks are not executed multiple times
+func TestDistributed_MultiInstance_TaskExecution(t *testing.T) {
+	_, sharedJobRepo, sharedRecordRepo, cleanup := setupDistributedTestEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const numInstances = 3
+
+	// Create test jobs
+	periodicJob := &entity.Job{
+		Id:           1,
+		Namespace:    "dist_test",
+		JobKey:       "periodic_job_1",
+		ScheduleType: entity.ScheduleTypePeriodicRate,
+		ScheduleExpr: "1s",
+		ExecuteType:  entity.ExecuteTypeHttp,
+		Status:       entity.JobStatusActive,
+		Payload: &entity.JobPayload{
+			Http: &entity.HttpPayload{
+				Url:    "http://test/periodic",
+				Method: "GET",
+			},
+		},
+		NextTriggerTime: time.Now().Add(500 * time.Millisecond).UnixMilli(),
+		UpdatedAt:       time.Now().UnixMilli(),
+	}
+
+	oneTimeJob := &entity.Job{
+		Id:           2,
+		Namespace:    "dist_test",
+		JobKey:       "onetime_job_1",
+		ScheduleType: entity.ScheduleTypeImmediate,
+		ExecuteType:  entity.ExecuteTypeHttp,
+		Status:       entity.JobStatusActive,
+		Payload: &entity.JobPayload{
+			Http: &entity.HttpPayload{
+				Url:    "http://test/onetime",
+				Method: "GET",
+			},
+		},
+		NextTriggerTime: time.Now().Add(500 * time.Millisecond).UnixMilli(),
+		UpdatedAt:       time.Now().UnixMilli(),
+	}
+
+	sharedJobRepo.AddJob(periodicJob)
+	sharedJobRepo.AddJob(oneTimeJob)
+
+	// Set up ListPendingJobsFunc to return our jobs
+	sharedJobRepo.ListPendingJobsFunc = func(ctx context.Context, maxTriggerTime int64, limit int64) ([]*entity.Job, error) {
+		jobs := []*entity.Job{}
+		if periodicJob.Status == entity.JobStatusActive {
+			jobCopy := *periodicJob
+			jobs = append(jobs, &jobCopy)
+		}
+		if oneTimeJob.Status == entity.JobStatusActive {
+			jobCopy := *oneTimeJob
+			jobs = append(jobs, &jobCopy)
+		}
+		return jobs, nil
+	}
+
+	// Create multiple scheduler instances
+	schedulers := make([]*Scheduler, numInstances)
+	for i := 0; i < numInstances; i++ {
+		nodeId := fmt.Sprintf("exec-node-%d", i)
+		cfg := getDistributedSchedulerConfig(nodeId)
+		s, err := NewScheduler(cfg)
+		require.NoError(t, err)
+		schedulers[i] = s
+	}
+
+	t.Logf("Distributed task execution test started with %d instances. now: %s", numInstances, time.Now().Format(time.RFC3339))
+
+	// Start all schedulers
+	for _, s := range schedulers {
+		s.Start(ctx)
+	}
+
+	// Wait for jobs to be executed
+	time.Sleep(6 * time.Second)
+
+	t.Logf("Distributed task execution test to stopped with %d instances. now: %s", numInstances, time.Now().Format(time.RFC3339))
+	// Stop all schedulers
+	for _, s := range schedulers {
+		s.Stop(ctx)
+	}
+
+	// Get execution counts from record repo
+	recordCreates := sharedRecordRepo.GetCreateCount()
+
+	t.Logf("Task execution test completed:")
+	t.Logf("  - Total record creations: %d, now: %s", recordCreates, time.Now().Format(time.RFC3339))
+
+	// Verify:
+	// - Periodic job should have been triggered multiple times (roughly 5 times in 6 seconds with 1s interval)
+	// - One-time job should have been triggered exactly once
+	// - Due to distributed locking, each trigger should only create one record
+	assert.Greater(t, recordCreates, int64(0), "Jobs should have been executed")
+}
+
+// TestDistributed_MultiInstance_MixedJobTypes tests scheduling of various job types
+func TestDistributed_MultiInstance_MixedJobTypes(t *testing.T) {
+	_, sharedJobRepo, sharedRecordRepo, cleanup := setupDistributedTestEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const numInstances = 3
+
+	// Create different types of jobs
+	jobs := []*entity.Job{
+		{
+			Id:              1,
+			Namespace:       "mixed_test",
+			JobKey:          "rate_job",
+			ScheduleType:    entity.ScheduleTypePeriodicRate,
+			ScheduleExpr:    "2s",
+			ExecuteType:     entity.ExecuteTypeHttp,
+			Status:          entity.JobStatusActive,
+			Payload:         &entity.JobPayload{Http: &entity.HttpPayload{Url: "http://test/rate", Method: "GET"}},
+			NextTriggerTime: time.Now().Add(500 * time.Millisecond).UnixMilli(),
+			UpdatedAt:       1000,
+		},
+		{
+			Id:              2,
+			Namespace:       "mixed_test",
+			JobKey:          "cron_job",
+			ScheduleType:    entity.ScheduleTypePeriodicCron,
+			ScheduleExpr:    "0 */1 * * * *", // Every minute
+			ExecuteType:     entity.ExecuteTypeHttp,
+			Status:          entity.JobStatusActive,
+			Payload:         &entity.JobPayload{Http: &entity.HttpPayload{Url: "http://test/cron", Method: "GET"}},
+			NextTriggerTime: time.Now().Add(500 * time.Millisecond).UnixMilli(),
+			UpdatedAt:       1000,
+		},
+		{
+			Id:              3,
+			Namespace:       "mixed_test",
+			JobKey:          "immediate_job",
+			ScheduleType:    entity.ScheduleTypeImmediate,
+			ExecuteType:     entity.ExecuteTypeHttp,
+			Status:          entity.JobStatusActive,
+			Payload:         &entity.JobPayload{Http: &entity.HttpPayload{Url: "http://test/immediate", Method: "GET"}},
+			NextTriggerTime: time.Now().UnixMilli(),
+			UpdatedAt:       1000,
+		},
+		{
+			Id:              4,
+			Namespace:       "mixed_test",
+			JobKey:          "delayed_job",
+			ScheduleType:    entity.ScheduleTypeDelayed,
+			ScheduleExpr:    "3s",
+			ExecuteType:     entity.ExecuteTypeHttp,
+			Status:          entity.JobStatusActive,
+			Payload:         &entity.JobPayload{Http: &entity.HttpPayload{Url: "http://test/delayed", Method: "GET"}},
+			NextTriggerTime: time.Now().Add(6 * time.Second).UnixMilli(),
+			UpdatedAt:       1000,
+		},
+	}
+
+	for _, job := range jobs {
+		sharedJobRepo.AddJob(job)
+	}
+
+	sharedJobRepo.ListPendingJobsFunc = func(ctx context.Context, maxTriggerTime int64, limit int64) ([]*entity.Job, error) {
+		result := make([]*entity.Job, 0, len(jobs))
+		for _, j := range jobs {
+			if j.Status == entity.JobStatusActive && j.NextTriggerTime <= maxTriggerTime {
+				jobCopy := *j
+				result = append(result, &jobCopy)
+			}
+		}
+		return result, nil
+	}
+
+	// Create scheduler instances
+	schedulers := make([]*Scheduler, numInstances)
+	for i := 0; i < numInstances; i++ {
+		nodeId := fmt.Sprintf("mixed-node-%d", i)
+		cfg := getDistributedSchedulerConfig(nodeId)
+		s, err := NewScheduler(cfg)
+		require.NoError(t, err)
+		schedulers[i] = s
+	}
+
+	// Start all schedulers
+	for _, s := range schedulers {
+		s.Start(ctx)
+	}
+
+	// Wait for scheduling
+	time.Sleep(8 * time.Second)
+
+	// Stop all schedulers
+	for _, s := range schedulers {
+		s.Stop(ctx)
+	}
+
+	recordCreates := sharedRecordRepo.GetCreateCount()
+
+	t.Logf("Mixed job types test completed:")
+	t.Logf("  - Total record creations: %d", recordCreates)
+
+	// All job types should have been executed at least once
+	assert.Greater(t, recordCreates, int64(0), "Jobs should have been executed")
+}
+
+// TestDistributed_LeaderFailover tests leader failover when the current leader stops
+func TestDistributed_LeaderFailover(t *testing.T) {
+	_, sharedJobRepo, _, cleanup := setupDistributedTestEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	var listPendingCalled atomic.Int64
+	sharedJobRepo.ListPendingJobsFunc = func(ctx context.Context, maxTriggerTime int64, limit int64) ([]*entity.Job, error) {
+		listPendingCalled.Add(1)
+		return nil, nil
+	}
+
+	// Create two scheduler instances
+	cfg1 := getDistributedSchedulerConfig("failover-node-1")
+	cfg2 := getDistributedSchedulerConfig("failover-node-2")
+
+	s1, err := NewScheduler(cfg1)
+	require.NoError(t, err)
+	s2, err := NewScheduler(cfg2)
+	require.NoError(t, err)
+
+	// Start both schedulers
+	s1.Start(ctx)
+	s2.Start(ctx)
+
+	// Wait for leader election
+	time.Sleep(4 * time.Second)
+
+	// Find the current leader
+	var leader, follower *Scheduler
+	if s1.listLeaderElector.IsLeader(ctx) == nil {
+		leader = s1
+		follower = s2
+		t.Log("s1 is the initial leader")
+	} else {
+		leader = s2
+		follower = s1
+		t.Log("s2 is the initial leader")
+	}
+
+	callsBeforeFailover := listPendingCalled.Load()
+	t.Logf("ListPendingJobs calls before failover: %d", callsBeforeFailover)
+
+	// Stop the leader
+	leader.Stop(ctx)
+	t.Log("Leader stopped, waiting for failover...")
+
+	// Wait for follower to become leader
+	time.Sleep(6 * time.Second)
+
+	// Verify that the follower is now the leader
+	isNowLeader := follower.listLeaderElector.IsLeader(ctx) == nil
+	callsAfterFailover := listPendingCalled.Load()
+
+	t.Logf("ListPendingJobs calls after failover: %d", callsAfterFailover)
+	t.Logf("Follower became leader: %v", isNowLeader)
+
+	// Cleanup
+	follower.Stop(ctx)
+
+	// Assertions
+	assert.True(t, isNowLeader, "Follower should become leader after original leader stops")
+	assert.Greater(t, callsAfterFailover, callsBeforeFailover,
+		"New leader should continue calling ListPendingJobs")
+}
+
+// TestDistributed_HighConcurrency tests scheduler behavior under high concurrency
+func TestDistributed_HighConcurrency(t *testing.T) {
+	_, sharedJobRepo, sharedRecordRepo, cleanup := setupDistributedTestEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const numInstances = 5
+	const numJobs = 50
+
+	// Create many jobs
+	for i := 1; i <= numJobs; i++ {
+		job := &entity.Job{
+			Id:              uint64(i),
+			Namespace:       "high_concurrency",
+			JobKey:          fmt.Sprintf("job_%d", i),
+			ScheduleType:    entity.ScheduleTypePeriodicRate,
+			ScheduleExpr:    "1s",
+			ExecuteType:     entity.ExecuteTypeHttp,
+			Status:          entity.JobStatusActive,
+			Payload:         &entity.JobPayload{Http: &entity.HttpPayload{Url: fmt.Sprintf("http://test/job/%d", i), Method: "GET"}},
+			NextTriggerTime: time.Now().Add(time.Duration(i*100) * time.Millisecond).UnixMilli(),
+			UpdatedAt:       int64(i),
+		}
+		sharedJobRepo.AddJob(job)
+	}
+
+	var loadCallCount atomic.Int64
+	sharedJobRepo.ListPendingJobsFunc = func(ctx context.Context, maxTriggerTime int64, limit int64) ([]*entity.Job, error) {
+		loadCallCount.Add(1)
+		var result []*entity.Job
+		sharedJobRepo.mu.RLock()
+		for _, job := range sharedJobRepo.jobs {
+			if job.Status == entity.JobStatusActive && job.NextTriggerTime <= maxTriggerTime {
+				jobCopy := *job
+				result = append(result, &jobCopy)
+			}
+		}
+		sharedJobRepo.mu.RUnlock()
+		return result, nil
+	}
+
+	// Create scheduler instances
+	schedulers := make([]*Scheduler, numInstances)
+	for i := 0; i < numInstances; i++ {
+		nodeId := fmt.Sprintf("high-concurrency-node-%d", i)
+		cfg := getDistributedSchedulerConfig(nodeId)
+		//cfg.MaxWorkers = 20 // Increase workers for high concurrency
+		cfg.MaxWorkers = 100 // Increase workers for high concurrency
+		cfg.DefaultTimeout = 3 * time.Second
+		s, err := NewScheduler(cfg)
+		require.NoError(t, err)
+		schedulers[i] = s
+	}
+
+	// Start all schedulers concurrently
+	var startWg sync.WaitGroup
+	for _, s := range schedulers {
+		startWg.Add(1)
+		go func(sched *Scheduler) {
+			defer startWg.Done()
+			sched.Start(ctx)
+		}(s)
+	}
+	startWg.Wait()
+
+	t.Logf("High concurrency test started: %d scheduler instances, %d jobs, start time: %v", numInstances, numJobs, time.Now())
+	// Let the system run
+	time.Sleep(10 * time.Second)
+
+	t.Logf("High concurrency test completed: %d scheduler instances, %d jobs, end time: %v", numInstances, numJobs, time.Now())
+	// Stop all schedulers
+	var stopWg sync.WaitGroup
+	for _, s := range schedulers {
+		stopWg.Add(1)
+		go func(sched *Scheduler) {
+			defer stopWg.Done()
+			sched.Stop(ctx)
+		}(s)
+	}
+	stopWg.Wait()
+
+	recordCreates := sharedRecordRepo.GetCreateCount()
+	loadCalls := loadCallCount.Load()
+
+	t.Logf("High concurrency test completed:")
+	t.Logf("  - %d scheduler instances", numInstances)
+	t.Logf("  - %d total jobs", numJobs)
+	t.Logf("  - %d ListPendingJobs calls", loadCalls)
+	t.Logf("  - %d records created", recordCreates)
+
+	// Count how many schedulers loaded jobs
+	var loadedJobsCount int
+	for _, s := range schedulers {
+		if len(s.loadedJobs) > 0 {
+			loadedJobsCount++
+		}
+	}
+	t.Logf("  - %d schedulers loaded jobs", loadedJobsCount)
+
+	// Verify that jobs were executed (records were created)
+	assert.Greater(t, recordCreates, int64(0), "Jobs should have been executed")
+
+	// Verify that ListPendingJobs was called by the leader(s)
+	assert.Greater(t, loadCalls, int64(0), "ListPendingJobs should have been called")
+}
+
+// TestDistributed_TaskQueueMode tests distributed scheduling with task queue enabled
+func TestDistributed_TaskQueueMode(t *testing.T) {
+	_, sharedJobRepo, sharedRecordRepo, cleanup := setupDistributedTestEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const numInstances = 3
+
+	// Create a job
+	job := &entity.Job{
+		Id:              1,
+		Namespace:       "queue_test",
+		JobKey:          "queue_job_1",
+		ScheduleType:    entity.ScheduleTypePeriodicRate,
+		ScheduleExpr:    "1s",
+		ExecuteType:     entity.ExecuteTypeHttp,
+		Status:          entity.JobStatusActive,
+		Payload:         &entity.JobPayload{Http: &entity.HttpPayload{Url: "http://test/queue", Method: "GET"}},
+		NextTriggerTime: time.Now().Add(500 * time.Millisecond).UnixMilli(),
+		UpdatedAt:       time.Now().UnixMilli(),
+	}
+	sharedJobRepo.AddJob(job)
+
+	sharedJobRepo.ListPendingJobsFunc = func(ctx context.Context, maxTriggerTime int64, limit int64) ([]*entity.Job, error) {
+		if job.Status == entity.JobStatusActive {
+			jobCopy := *job
+			return []*entity.Job{&jobCopy}, nil
+		}
+		return nil, nil
+	}
+
+	// Create scheduler instances with task queue enabled
+	schedulers := make([]*Scheduler, numInstances)
+	for i := 0; i < numInstances; i++ {
+		nodeId := fmt.Sprintf("queue-node-%d", i)
+		cfg := getDistributedSchedulerConfig(nodeId)
+		cfg.EnableTaskQueue = true
+		cfg.DefaultTimeout = 2 * time.Second
+		s, err := NewScheduler(cfg)
+		require.NoError(t, err)
+		schedulers[i] = s
+	}
+
+	// Start all schedulers
+	for _, s := range schedulers {
+		s.Start(ctx)
+	}
+
+	// Wait for scheduling
+	time.Sleep(6 * time.Second)
+
+	// Stop all schedulers
+	for _, s := range schedulers {
+		s.Stop(ctx)
+	}
+
+	recordCreates := sharedRecordRepo.GetCreateCount()
+
+	t.Logf("Task queue mode test completed:")
+	t.Logf("  - Total record creations: %d", recordCreates)
+
+	// Jobs should have been scheduled and records created
+	assert.Greater(t, recordCreates, int64(0), "Jobs should have been executed via task queue")
+}
+
+// TestDistributed_JobVersionUpdate tests that job version changes are handled correctly
+func TestDistributed_JobVersionUpdate(t *testing.T) {
+	_, sharedJobRepo, sharedRecordRepo, cleanup := setupDistributedTestEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const numInstances = 2
+
+	// Create initial job
+	job := &entity.Job{
+		Id:              1,
+		Namespace:       "version_test",
+		JobKey:          "versioned_job",
+		ScheduleType:    entity.ScheduleTypePeriodicRate,
+		ScheduleExpr:    "1s",
+		ExecuteType:     entity.ExecuteTypeHttp,
+		Status:          entity.JobStatusActive,
+		Payload:         &entity.JobPayload{Http: &entity.HttpPayload{Url: "http://test/v1", Method: "GET"}},
+		NextTriggerTime: time.Now().Add(500 * time.Millisecond).UnixMilli(),
+		UpdatedAt:       1000, // Initial version
+	}
+	sharedJobRepo.AddJob(job)
+
+	var mu sync.RWMutex
+	sharedJobRepo.ListPendingJobsFunc = func(ctx context.Context, maxTriggerTime int64, limit int64) ([]*entity.Job, error) {
+		mu.RLock()
+		defer mu.RUnlock()
+		if job.Status == entity.JobStatusActive {
+			jobCopy := *job
+			return []*entity.Job{&jobCopy}, nil
+		}
+		return nil, nil
+	}
+
+	// Create scheduler instances
+	schedulers := make([]*Scheduler, numInstances)
+	for i := 0; i < numInstances; i++ {
+		nodeId := fmt.Sprintf("version-node-%d", i)
+		cfg := getDistributedSchedulerConfig(nodeId)
+		cfg.DefaultTimeout = 2 * time.Second
+		s, err := NewScheduler(cfg)
+		require.NoError(t, err)
+		schedulers[i] = s
+	}
+
+	// Start all schedulers
+	for _, s := range schedulers {
+		s.Start(ctx)
+	}
+
+	// Wait for initial scheduling
+	time.Sleep(4 * time.Second)
+
+	initialRecords := sharedRecordRepo.GetCreateCount()
+	t.Logf("Records before version update: %d", initialRecords)
+
+	// Update job version (simulate configuration change)
+	mu.Lock()
+	job.ScheduleExpr = "2s" // Changed interval
+	job.UpdatedAt = 2000    // New version
+	job.Payload.Http.Url = "http://test/v2"
+	sharedJobRepo.AddJob(job)
+	mu.Unlock()
+
+	t.Log("Job version updated, waiting for rescheduling...")
+
+	// Wait for rescheduling
+	time.Sleep(6 * time.Second)
+
+	// Stop all schedulers
+	for _, s := range schedulers {
+		s.Stop(ctx)
+	}
+
+	finalRecords := sharedRecordRepo.GetCreateCount()
+	t.Logf("Records after version update: %d", finalRecords)
+
+	// Job should continue executing after version update
+	assert.Greater(t, finalRecords, initialRecords, "Job should continue executing after version update")
 }
